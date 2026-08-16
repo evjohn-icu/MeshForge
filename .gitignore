@@ -1,0 +1,12 @@
+# Local state and build outputs
+team-installer
+dist/
+
+# Local controller state
+state.json
+*.log
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/

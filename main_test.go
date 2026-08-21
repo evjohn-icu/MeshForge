@@ -3,14 +3,18 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,8 +28,8 @@ func testProject() Project {
 		NetworkName:    "team-network",
 		NetworkSecret:  "sixteen-character-secret",
 		GitHubProxy:    "https://ghfast.top/",
-		Relay:          Node{ID: "relay0001", Role: "relay", Name: "relay", OS: "linux", OverlayIP: "10.144.144.1", Host: "relay.example.com", SSHPort: 22},
-		Nodes:          []Node{{ID: "member01", Role: "member", Name: "office", OS: "linux", OverlayIP: "10.144.144.2", SSHPort: 22}},
+		Relay:          Node{ID: "aa000001", Role: "relay", Name: "relay", OS: "linux", OverlayIP: "10.144.144.1", Host: "relay.example.com", SSHPort: 22},
+		Nodes:          []Node{{ID: "bb000002", Role: "member", Name: "office", OS: "linux", OverlayIP: "10.144.144.2", SSHPort: 22}},
 	}
 }
 
@@ -67,13 +71,13 @@ func TestRelayWireGuardPortalConfiguration(t *testing.T) {
 func TestInstallScriptsUseConfiguredProxy(t *testing.T) {
 	project := testProject()
 	linux := linuxScript(project, project.Nodes[0])
-	if !strings.Contains(linux, `GITHUB_PROXY="https://ghfast.top/"`) || !strings.Contains(linux, "easytier-linux-${ARCH}-v2.6.4.zip") {
+	if !strings.Contains(linux, `GITHUB_PROXY='https://ghfast.top/'`) || !strings.Contains(linux, "easytier-linux-${ARCH}-v2.6.4.zip") {
 		t.Fatalf("linux script did not retain proxy and version:\n%s", linux)
 	}
 	windowsNode := project.Nodes[0]
 	windowsNode.OS = "windows"
 	windows := windowsScript(project, windowsNode)
-	if !strings.Contains(windows, `$GitHubProxy = "https://ghfast.top/"`) || !strings.Contains(windows, "easytier-windows-$Arch-$Version.zip") {
+	if !strings.Contains(windows, `$GitHubProxy = 'https://ghfast.top/'`) || !strings.Contains(windows, "easytier-windows-$Arch-$Version.zip") {
 		t.Fatalf("windows script did not retain proxy and version:\n%s", windows)
 	}
 }
@@ -95,7 +99,7 @@ func TestDesktopLinuxScriptInstallsOfficialGUI(t *testing.T) {
 	node.LinuxDeviceType = "desktop"
 	script := linuxScript(project, node)
 	for _, expected := range []string{
-		`LINUX_DEVICE_TYPE="desktop"`,
+		`LINUX_DEVICE_TYPE='desktop'`,
 		`easytier-gui_${GUI_VERSION}_${DEB_ARCH}.deb`,
 		`easytier-gui_${GUI_VERSION}_${GUI_ARCH}.AppImage`,
 	} {
@@ -103,7 +107,7 @@ func TestDesktopLinuxScriptInstallsOfficialGUI(t *testing.T) {
 			t.Fatalf("desktop script missing %q:\n%s", expected, script)
 		}
 	}
-	if strings.Contains(linuxScript(project, project.Relay), `LINUX_DEVICE_TYPE="desktop"`) {
+	if strings.Contains(linuxScript(project, project.Relay), `LINUX_DEVICE_TYPE='desktop'`) {
 		t.Fatal("relay must never use desktop GUI mode")
 	}
 }
@@ -114,6 +118,11 @@ func TestLinuxScriptCoversRequestedDistributions(t *testing.T) {
 	node.LinuxDeviceType = "desktop"
 	script := linuxScript(project, node)
 	for _, expected := range []string{
+		"export DEBIAN_FRONTEND=noninteractive",
+		"--retry-all-errors --connect-timeout 10 --max-time 300 --speed-limit 1024 --speed-time 30 -C -",
+		"trap 'cleanup; exit 1' INT TERM HUP",
+		"[ -f \"$backup\" ] || cp -p \"$source\" \"$backup\"",
+		"警告：服务未保持运行",
 		"nix profile install nixpkgs#curl nixpkgs#unzip",
 		"nix run nixpkgs#appimage-run",
 		"apk add --no-cache curl unzip",
@@ -209,7 +218,7 @@ func TestDeploySSHStreamsGeneratedScript(t *testing.T) {
 
 	host, portText, _ := net.SplitHostPort(listener.Addr().String())
 	port, _ := strconv.Atoi(portText)
-	result, err := deploySSH(Node{Host: host, SSHPort: port, SSHUser: "root", SSHAuth: "password", SSHPassword: "test-password"}, "echo deploy-smoke\n")
+	result, err := deploySSH(Node{Host: host, SSHPort: port, SSHUser: "root", SSHAuth: "password", SSHPassword: "test-password"}, "echo deploy-smoke\n", 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,5 +268,184 @@ func serveTestSSH(listener net.Listener, config *ssh.ServerConfig, received chan
 		_, _ = io.WriteString(channel, "remote complete\n")
 		_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
 		return
+	}
+}
+
+func TestShellQuoteRoundTripsThroughBash(t *testing.T) {
+	for _, value := range []string{"plain", "a'b", `$(id -u)`, `x"y`, "back`tick", `semi;pipe|`, "newline\ninside", "trailing space "} {
+		command := "printf '%s' " + shellQuote(value)
+		output, err := exec.Command("bash", "-c", command).CombinedOutput()
+		if err != nil {
+			t.Fatalf("bash rejected %q: %v", value, err)
+		}
+		if string(output) != value {
+			t.Fatalf("round trip %q → %q", value, output)
+		}
+	}
+}
+
+func TestLinuxScriptEscapesHostileNodeName(t *testing.T) {
+	project := testProject()
+	node := project.Nodes[0]
+	node.Name = `pc$(echo pwned) && touch /tmp/easytier-pwned`
+	script := linuxScript(project, node)
+	scriptPath := filepath.Join(t.TempDir(), "install.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("bash", "-n", scriptPath).CombinedOutput(); err != nil {
+		t.Fatalf("hostile name broke script syntax: %v\n%s", err, output)
+	}
+	var line string
+	for _, candidate := range strings.Split(script, "\n") {
+		if strings.HasPrefix(candidate, "echo ") && strings.Contains(candidate, "已部署") {
+			line = candidate
+		}
+	}
+	if line == "" {
+		t.Fatal("deployment echo line not found")
+	}
+	output, err := exec.Command("bash", "-c", line).CombinedOutput()
+	if err != nil {
+		t.Fatalf("hostile name broke the echo line: %v\n%s", err, output)
+	}
+	if string(output) != "EasyTier 节点 "+node.Name+" 已部署，虚拟 IP："+node.OverlayIP+"\n" {
+		t.Fatalf("unexpected echo output: %q", output)
+	}
+	if _, err := os.Stat("/tmp/easytier-pwned"); err == nil {
+		t.Fatal("injected command executed")
+	}
+}
+
+func TestProjectValidationRejectsUnsafeNodeID(t *testing.T) {
+	project := testProject()
+	project.Nodes[0].ID = ";echo HI;"
+	if err := validateProject(project); err == nil {
+		t.Fatal("unsafe node ID passed validation")
+	}
+	project.Nodes[0].ID = "3f0c1b2e-5a6d-4f7a-8c9d-0e1f2a3b4c5d"
+	if err := validateProject(project); err != nil {
+		t.Fatalf("UUID node ID rejected: %v", err)
+	}
+}
+
+func TestLoadStoreValidatesStateFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	project := testProject()
+	project.Nodes[0].ID = ";echo HI;"
+	encoded, err := json.Marshal(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadStore(path); err == nil {
+		t.Fatal("invalid persisted state loaded without error")
+	}
+	if _, err := loadStore(filepath.Join(dir, "missing.json")); err != nil {
+		t.Fatalf("fresh load failed: %v", err)
+	}
+}
+
+func TestTrustHostConcurrentPersistsFingerprints(t *testing.T) {
+	state := &store{tokens: make(map[string]installToken)}
+	state.path = filepath.Join(t.TempDir(), "state.json")
+	project := testProject()
+	if err := state.save(project); err != nil {
+		t.Fatal(err)
+	}
+	relayID, nodeID := project.Relay.ID, project.Nodes[0].ID
+	const rounds = 50
+	var wait sync.WaitGroup
+	wait.Add(rounds * 2)
+	for range rounds {
+		go func() {
+			defer wait.Done()
+			if err := state.trustHost(relayID, "fp-relay"); err != nil {
+				t.Error(err)
+			}
+		}()
+		go func() {
+			defer wait.Done()
+			if err := state.trustHost(nodeID, "fp-node"); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wait.Wait()
+	saved := state.snapshot()
+	if saved.Relay.HostKeyFingerprint != "fp-relay" || saved.Nodes[0].HostKeyFingerprint != "fp-node" {
+		t.Fatalf("concurrent trustHost lost an update: relay=%q node=%q", saved.Relay.HostKeyFingerprint, saved.Nodes[0].HostKeyFingerprint)
+	}
+	content, err := os.ReadFile(state.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk Project
+	if err := json.Unmarshal(content, &onDisk); err != nil {
+		t.Fatalf("state file corrupted: %v", err)
+	}
+	if onDisk.Relay.HostKeyFingerprint != "fp-relay" || onDisk.Nodes[0].HostKeyFingerprint != "fp-node" {
+		t.Fatal("on-disk state lost an update")
+	}
+}
+
+func TestPublicListenerRejectsAdminRoutes(t *testing.T) {
+	application := &app{store: &store{tokens: make(map[string]installToken)}}
+	for _, path := range []string{"/api/project", "/", "/agents/", "/agents/node-agent"} {
+		response := httptest.NewRecorder()
+		application.servePublic(response, httptest.NewRequest("GET", path, nil))
+		if response.Code == 200 {
+			t.Fatalf("public listener served admin route %s", path)
+		}
+	}
+	response := httptest.NewRecorder()
+	application.servePublic(response, httptest.NewRequest("GET", "/install/unknown-token", nil))
+	if response.Code != http.StatusGone {
+		t.Fatalf("install with invalid token = %d, want 410", response.Code)
+	}
+}
+
+func TestDeploySSHHandshakeTimeout(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		time.Sleep(30 * time.Second)
+	}()
+	host, portText, _ := net.SplitHostPort(listener.Addr().String())
+	port, _ := strconv.Atoi(portText)
+	started := time.Now()
+	_, err = deploySSH(Node{Host: host, SSHPort: port, SSHUser: "root", SSHAuth: "password", SSHPassword: "irrelevant"}, "echo hi\n", 2*time.Second)
+	if err == nil {
+		t.Fatal("handshake stall returned success")
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("handshake stall took %s, timeout not enforced", elapsed)
+	}
+}
+
+func TestWindowsScriptQuotesHostileValues(t *testing.T) {
+	project := testProject()
+	node := project.Nodes[0]
+	node.OS = "windows"
+	node.Name = "weird'name$x"
+	script := windowsScript(project, node)
+	for _, expected := range []string{
+		`--display-name 'EasyTier Team - weird''name$x'`,
+		`Write-Host 'EasyTier 节点 weird''name$x 已部署，虚拟 IP：10.144.144.2' -ForegroundColor Green`,
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("windows script missing %q:\n%s", expected, script)
+		}
 	}
 }

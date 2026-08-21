@@ -103,6 +103,14 @@ func loadStore(path string) (*store, error) {
 	if s.project.Relay.ID == "" {
 		s.project.Relay = defaultProject().Relay
 	}
+	for index := range s.project.Nodes {
+		if s.project.Nodes[index].ID == "" {
+			s.project.Nodes[index].ID = newID()
+		}
+	}
+	if err := validateProject(s.project); err != nil {
+		return nil, fmt.Errorf("本地状态校验失败: %w", err)
+	}
 	return s, nil
 }
 
@@ -119,6 +127,12 @@ func cloneProject(project Project) Project {
 }
 
 func (s *store) save(project Project) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked(project)
+}
+
+func (s *store) saveLocked(project Project) error {
 	if project.ProbeToken == "" {
 		project.ProbeToken = randomHex(32)
 	}
@@ -139,9 +153,7 @@ func (s *store) save(project Project) error {
 	if err := os.Rename(temporary, s.path); err != nil {
 		return fmt.Errorf("保存本地状态: %w", err)
 	}
-	s.mu.Lock()
 	s.project = cloneProject(project)
-	s.mu.Unlock()
 	return nil
 }
 
@@ -162,7 +174,9 @@ func (s *store) trustHost(id, fingerprint string) error {
 	if fingerprint == "" {
 		return nil
 	}
-	project := s.snapshot()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project := cloneProject(s.project)
 	if project.Relay.ID == id && project.Relay.HostKeyFingerprint == "" {
 		project.Relay.HostKeyFingerprint = fingerprint
 	} else {
@@ -172,7 +186,7 @@ func (s *store) trustHost(id, fingerprint string) error {
 			}
 		}
 	}
-	return s.save(project)
+	return s.saveLocked(project)
 }
 
 func (s *store) newToken(nodeID string) (string, error) {
@@ -238,8 +252,11 @@ func validateProject(project Project) error {
 	ips := map[string]bool{}
 	names := map[string]bool{}
 	for _, node := range allNodes {
-		if node.ID == "" || invalidConfigString(node.Name) {
+		if invalidConfigString(node.Name) {
 			return errors.New("每个节点都必须有名称")
+		}
+		if !validNodeID(node.ID) {
+			return fmt.Errorf("节点 %s 的 ID 无效", node.Name)
 		}
 		if names[node.Name] {
 			return fmt.Errorf("节点名称重复：%s", node.Name)
@@ -286,6 +303,20 @@ func validVersion(version string) bool {
 func invalidConfigString(value string) bool {
 	value = strings.TrimSpace(value)
 	return value == "" || strings.ContainsAny(value, "\r\n\x00")
+}
+
+func validNodeID(id string) bool {
+	for _, char := range id {
+		if !(char == '-' || char >= '0' && char <= '9' || char >= 'a' && char <= 'f' || char >= 'A' && char <= 'F') {
+			return false
+		}
+	}
+	return len(id) > 0
+}
+
+// shellQuote 把任意字符串变成 POSIX sh 单引号安全字面量。
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
 func tomlString(value string) string {
@@ -366,19 +397,20 @@ fi
 	}
 	return fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "请使用 sudo 运行此安装器。" >&2
   exit 1
 fi
 
-INSTALL_DIR=%q
+INSTALL_DIR=%s
 CONFIG_FILE="$INSTALL_DIR/config/easytier.toml"
 UNIT_FILE=/etc/systemd/system/%s
 OPENRC_SERVICE=easytier-team-%s
-VERSION=%q
-GITHUB_PROXY=%q
-LINUX_DEVICE_TYPE=%q
+VERSION=%s
+GITHUB_PROXY=%s
+LINUX_DEVICE_TYPE=%s
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH=x86_64; GUI_ARCH=amd64; DEB_ARCH=amd64; RPM_ARCH=x86_64 ;;
@@ -394,7 +426,7 @@ if ! command -v systemctl >/dev/null 2>&1; then
 fi
 
 probe_url() {
-  if command -v curl >/dev/null 2>&1; then curl --connect-timeout 3 --max-time 8 --fail --silent --show-error --location --head "$1" >/dev/null 2>&1
+  if command -v curl >/dev/null 2>&1; then curl --connect-timeout 3 --max-time 8 --silent --show-error --location --head "$1" >/dev/null 2>&1
   elif command -v wget >/dev/null 2>&1; then wget -q --spider --timeout=8 "$1" >/dev/null 2>&1
   else return 1; fi
 }
@@ -426,6 +458,7 @@ restore_package_mirrors() {
 }
 cleanup() { restore_package_mirrors; rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
+trap 'cleanup; exit 1' INT TERM HUP
 
 configure_china_package_mirrors() {
   [ "$NETWORK_REGION" = china ] || return 0
@@ -435,7 +468,7 @@ configure_china_package_mirrors() {
     for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
       [ -f "$source" ] || continue
       backup="$source.$OPENRC_SERVICE.eot-backup"
-      cp -p "$source" "$backup"
+      [ -f "$backup" ] || cp -p "$source" "$backup"
       MIRROR_BACKUPS+=("$source")
       sed -i -E \
         -e "s@([a-z]+://)([^/]*\\.)?archive\\.ubuntu\\.com/ubuntu/?@\\1${mirror_host}/ubuntu/@g" \
@@ -445,12 +478,12 @@ configure_china_package_mirrors() {
     apt-get update || echo "教育网 APT 镜像刷新失败，继续使用现有缓存。"
   elif command -v pacman >/dev/null 2>&1 && [ -f /etc/pacman.d/mirrorlist ]; then
     source=/etc/pacman.d/mirrorlist; backup="$source.$OPENRC_SERVICE.eot-backup"
-    cp -p "$source" "$backup"; MIRROR_BACKUPS+=("$source")
+    [ -f "$backup" ] || cp -p "$source" "$backup"; MIRROR_BACKUPS+=("$source")
     { echo "Server = $CN_MIRROR/archlinux/\$repo/os/\$arch"; cat "$backup"; } > "$source"
     pacman -Syy --noconfirm || echo "教育网 Arch 镜像刷新失败，继续使用已有镜像。"
   elif command -v apk >/dev/null 2>&1 && [ -f /etc/apk/repositories ]; then
     source=/etc/apk/repositories; backup="$source.$OPENRC_SERVICE.eot-backup"
-    cp -p "$source" "$backup"; MIRROR_BACKUPS+=("$source")
+    [ -f "$backup" ] || cp -p "$source" "$backup"; MIRROR_BACKUPS+=("$source")
     sed -i "s@https\\?://dl-cdn\\.alpinelinux\\.org/alpine@$CN_MIRROR/alpine@g" "$source"
     apk update || echo "教育网 Alpine 镜像刷新失败，继续使用已有镜像。"
   else
@@ -482,7 +515,7 @@ if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! 
 fi
 
 download() {
-  curl --fail --location --retry 3 --output "$2" "${GITHUB_PROXY}$1"
+  curl --fail --location --retry 3 --retry-all-errors --connect-timeout 10 --max-time 300 --speed-limit 1024 --speed-time 30 -C - --output "$2" "${GITHUB_PROXY}$1"
 }
 
 ASSET=%q
@@ -587,8 +620,14 @@ fi
 
 if [ "$INIT_SYSTEM" = systemd ]; then systemctl --no-pager --full status "$OPENRC_SERVICE.service" || true
 else rc-service "$OPENRC_SERVICE" status || true; fi
-echo "EasyTier 节点 %s 已部署，虚拟 IP：%s"
-`, installDir, unit, shortNodeID, project.ReleaseVersion, proxy, deviceType, asset, config, node.Name, installDir, configFile, firewall, installDir, configFile, node.Name, node.OverlayIP)
+sleep 3
+if [ "$INIT_SYSTEM" = systemd ]; then
+  systemctl is-active --quiet "$OPENRC_SERVICE.service" || echo "警告：服务未保持运行，请检查 journalctl -u $OPENRC_SERVICE.service" >&2
+else
+  rc-service "$OPENRC_SERVICE" status >/dev/null 2>&1 || echo "警告：服务未保持运行，请检查 rc-service 状态" >&2
+fi
+echo %s
+`, shellQuote(installDir), shellQuote(unit), shellQuote(shortNodeID), shellQuote(project.ReleaseVersion), shellQuote(proxy), shellQuote(deviceType), asset, config, node.Name, installDir, configFile, firewall, installDir, configFile, shellQuote("EasyTier 节点 "+node.Name+" 已部署，虚拟 IP："+node.OverlayIP))
 }
 
 func windowsScript(project Project, node Node) string {
@@ -598,7 +637,7 @@ func windowsScript(project Project, node Node) string {
 $ErrorActionPreference = "Stop"
 $Version = %s
 $GitHubProxy = %s
-$InstallDir = "C:\\EasyTierTeam\\%s"
+$InstallDir = "C:\\EasyTierTeam\\" + %s
 $ConfigFile = Join-Path $InstallDir "easytier.toml"
 $Arch = if ([Environment]::Is64BitOperatingSystem) { "x86_64" } else { "i686" }
 $Asset = "https://github.com/EasyTier/EasyTier/releases/download/$Version/easytier-windows-$Arch-$Version.zip"
@@ -623,12 +662,13 @@ Copy-Item "$SourceDir\\easytier-cli.exe" "$InstallDir\\easytier-cli.exe" -Force
 & "$InstallDir\\easytier-cli.exe" service start
 Remove-Item $TempZip -Force -ErrorAction SilentlyContinue
 Remove-Item $ExtractDir -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "EasyTier 节点 %s 已部署，虚拟 IP：%s" -ForegroundColor Green
-`, psString(project.ReleaseVersion), psString(proxy), shortID(node.ID), config, psString("EasyTier Team - "+node.Name), node.Name, node.OverlayIP)
+Write-Host %s -ForegroundColor Green
+`, psString(project.ReleaseVersion), psString(proxy), psString(shortID(node.ID)), config, psString("EasyTier Team - "+node.Name), psString("EasyTier 节点 "+node.Name+" 已部署，虚拟 IP："+node.OverlayIP))
 }
 
+// psString 把任意字符串变成 PowerShell 单引号安全字面量。
 func psString(value string) string {
-	return `"` + strings.ReplaceAll(value, "\"", "`\"") + `"`
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func shortID(id string) string {
@@ -672,16 +712,33 @@ func (a *app) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/agents/") {
-		name := filepath.Base(strings.TrimPrefix(r.URL.Path, "/agents/"))
-		if name == "." || name == ".." || name == "" || a.agentDir == "" {
-			http.NotFound(w, r)
-			return
-		}
-		http.ServeFile(w, r, filepath.Join(a.agentDir, name))
+		a.serveAgent(w, r)
 		return
 	}
 	web, _ := fs.Sub(webFS, "web")
 	http.FileServer(http.FS(web)).ServeHTTP(w, r)
+}
+
+// servePublic 只对外提供安装脚本与探针二进制，管理 API 与 UI 一律不可达。
+func (a *app) servePublic(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/install/") {
+		a.install(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/agents/") {
+		a.serveAgent(w, r)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (a *app) serveAgent(w http.ResponseWriter, r *http.Request) {
+	name := filepath.Base(strings.TrimPrefix(r.URL.Path, "/agents/"))
+	if name == "." || name == ".." || name == "" || a.agentDir == "" {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, filepath.Join(a.agentDir, name))
 }
 
 func (a *app) api(w http.ResponseWriter, r *http.Request) {
@@ -744,9 +801,9 @@ func (a *app) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		installURL := a.installBase(project) + "/install/" + token
-		command := "curl -fsSL '" + installURL + "' | sudo bash"
+		command := "curl -fsSL " + shellQuote(installURL) + " | sudo bash"
 		if node.OS == "windows" {
-			command = "irm '" + installURL + "' | iex"
+			command = "irm " + psString(installURL) + " | iex"
 		}
 		png, err := qrcode.Encode(command, qrcode.Medium, 256)
 		if err != nil {
@@ -759,7 +816,7 @@ func (a *app) api(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, errors.New("Windows 节点请使用生成的 PowerShell 安装入口"))
 			return
 		}
-		result, err := deploySSH(node, linuxScript(project, node))
+		result, err := deploySSH(node, linuxScript(project, node), deployTimeout)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, fmt.Errorf("SSH 部署 %s: %w", node.Name, err))
 			return
@@ -848,53 +905,64 @@ type probeResult struct {
 	IperfError string          `json:"iperfError,omitempty"`
 }
 
+const deployTimeout = 30 * time.Minute
+
 func (a *app) runSequentialProbes(project Project) []probeResult {
 	nodes := append([]Node{project.Relay}, project.Nodes...)
 	client := &http.Client{Timeout: 8 * time.Second}
 	results := make([]probeResult, 0, len(nodes))
 	for _, node := range nodes {
-		result := probeResult{NodeID: node.ID, Name: node.Name, OverlayIP: node.OverlayIP}
-		if node.OS != "linux" {
-			result.PingError = "一次性探针目前要求 Linux SSH 节点"
-			results = append(results, result)
-			continue
-		}
-		if err := startEphemeralProbe(node, a.installBase(project), project.ProbeToken); err != nil {
-			result.PingError = err.Error()
-			results = append(results, result)
-			continue
-		}
-		body, _ := json.Marshal(map[string]string{"requestId": newID(), "controllerTime": time.Now().UTC().Format(time.RFC3339Nano), "machine": node.Name})
-		request, _ := http.NewRequest(http.MethodPost, "http://"+net.JoinHostPort(node.OverlayIP, "19090")+"/v1/ping", bytes.NewReader(body))
-		request.Header.Set("Authorization", "Bearer "+project.ProbeToken)
-		request.Header.Set("Content-Type", "application/json")
-		started := time.Now()
-		response, err := client.Do(request)
-		if err != nil {
-			result.PingError = err.Error()
-			results = append(results, result)
-			continue
-		}
-		payload, readErr := io.ReadAll(io.LimitReader(response.Body, 128<<10))
-		response.Body.Close()
-		if response.StatusCode != http.StatusOK || readErr != nil {
-			result.PingError = response.Status
-			results = append(results, result)
-			continue
-		}
-		result.PingMS, result.Pong = float64(time.Since(started).Microseconds())/1000, payload
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		output, runErr := exec.CommandContext(ctx, "iperf3", "-J", "-c", node.OverlayIP, "-t", "3").Output()
-		cancel()
-		if runErr != nil {
-			result.IperfError = runErr.Error()
-		} else {
-			result.Iperf = output
-		}
-		_, _ = deploySSH(node, "rm -f /tmp/easytier-node-probe")
-		results = append(results, result)
+		results = append(results, a.probeOne(project, node, client))
 	}
 	return results
+}
+
+func (a *app) probeOne(project Project, node Node, client *http.Client) probeResult {
+	result := probeResult{NodeID: node.ID, Name: node.Name, OverlayIP: node.OverlayIP}
+	if node.OS != "linux" {
+		result.PingError = "一次性探针目前要求 Linux SSH 节点"
+		return result
+	}
+	if err := startEphemeralProbe(node, a.installBase(project), project.ProbeToken); err != nil {
+		result.PingError = err.Error()
+		return result
+	}
+	defer cleanupProbe(node)
+	body, _ := json.Marshal(map[string]string{"requestId": newID(), "controllerTime": time.Now().UTC().Format(time.RFC3339Nano), "machine": node.Name})
+	request, _ := http.NewRequest(http.MethodPost, "http://"+net.JoinHostPort(node.OverlayIP, "19090")+"/v1/ping", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+project.ProbeToken)
+	request.Header.Set("Content-Type", "application/json")
+	started := time.Now()
+	response, err := client.Do(request)
+	if err != nil {
+		result.PingError = err.Error()
+		return result
+	}
+	payload, readErr := io.ReadAll(io.LimitReader(response.Body, 128<<10))
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || readErr != nil {
+		result.PingError = response.Status
+		return result
+	}
+	result.PingMS, result.Pong = float64(time.Since(started).Microseconds())/1000, payload
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	output, runErr := exec.CommandContext(ctx, "iperf3", "-J", "-c", node.OverlayIP, "-t", "3").Output()
+	cancel()
+	if runErr != nil {
+		result.IperfError = runErr.Error()
+	} else {
+		result.Iperf = output
+	}
+	return result
+}
+
+// cleanupProbe 清掉目标机上残留的一次性探针进程与文件；所有退出路径都调用，
+// 防止远端 node-agent/iperf3 永久驻留占住 19090 端口。
+func cleanupProbe(node Node) {
+	command := "rm -f /tmp/easytier-node-probe /tmp/easytier-node-probe.log /tmp/easytier-iperf3.log; " +
+		"pkill -f /tmp/easytier-node-probe 2>/dev/null || true; " +
+		"pkill -f " + shellQuote("iperf3 -s -1 -B "+node.OverlayIP) + " 2>/dev/null || true"
+	_, _ = deploySSH(node, command, 60*time.Second)
 }
 
 func startEphemeralProbe(node Node, agentBase, token string) error {
@@ -908,18 +976,18 @@ case "$(uname -m)" in
   armv7l|armv7) ARCH=armv7 ;;
   *) echo "unsupported architecture" >&2; exit 1 ;;
 esac
-curl --fail --location --retry 2 -o /tmp/easytier-node-probe %q/agents/node-agent-linux-${ARCH}
+curl --fail --location --retry 2 -o /tmp/easytier-node-probe %s/agents/node-agent-linux-${ARCH}
 chmod 0700 /tmp/easytier-node-probe
-nohup /tmp/easytier-node-probe --once --listen %q --token %q --node-id %q --overlay-ip %q >/tmp/easytier-node-probe.log 2>&1 &
-nohup iperf3 -s -1 -B %q >/tmp/easytier-iperf3.log 2>&1 &
-`, strings.TrimRight(agentBase, "/"), net.JoinHostPort(node.OverlayIP, "19090"), token, node.ID, node.OverlayIP, node.OverlayIP)
-	_, err := deploySSH(node, script)
+nohup /tmp/easytier-node-probe --once --once-timeout 15m --listen %s --token %s --node-id %s --overlay-ip %s >/tmp/easytier-node-probe.log 2>&1 &
+nohup iperf3 -s -1 -B %s >/tmp/easytier-iperf3.log 2>&1 &
+`, shellQuote(strings.TrimRight(agentBase, "/")), shellQuote(net.JoinHostPort(node.OverlayIP, "19090")), shellQuote(token), shellQuote(node.ID), shellQuote(node.OverlayIP), shellQuote(node.OverlayIP))
+	_, err := deploySSH(node, script, 60*time.Second)
 	return err
 }
 
 type deployResult struct{ output, fingerprint string }
 
-func deploySSH(node Node, script string) (deployResult, error) {
+func deploySSH(node Node, script string, timeout time.Duration) (deployResult, error) {
 	if node.Host == "" || node.SSHUser == "" {
 		return deployResult{}, errors.New("Linux 节点需要 SSH 主机和用户")
 	}
@@ -952,7 +1020,11 @@ func deploySSH(node Node, script string) (deployResult, error) {
 		return deployResult{}, errors.New("SSH 登录方式必须是 key 或 password")
 	}
 	fingerprint := ""
-	config := &ssh.ClientConfig{User: node.SSHUser, Auth: []ssh.AuthMethod{auth}, Timeout: 15 * time.Second, HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+	handshakeTimeout := 15 * time.Second
+	if timeout < handshakeTimeout {
+		handshakeTimeout = timeout
+	}
+	config := &ssh.ClientConfig{User: node.SSHUser, Auth: []ssh.AuthMethod{auth}, Timeout: handshakeTimeout, HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
 		observed := ssh.FingerprintSHA256(key)
 		if node.HostKeyFingerprint != "" && node.HostKeyFingerprint != observed {
 			return fmt.Errorf("SSH 主机指纹不匹配：期望 %s，实际 %s", node.HostKeyFingerprint, observed)
@@ -964,13 +1036,20 @@ func deploySSH(node Node, script string) (deployResult, error) {
 	if _, _, err := net.SplitHostPort(node.Host); err == nil {
 		address = node.Host
 	}
-	connection, err := net.DialTimeout("tcp", address, 15*time.Second)
+	connection, err := net.DialTimeout("tcp", address, handshakeTimeout)
 	if err != nil {
 		return deployResult{}, err
 	}
 	defer connection.Close()
+	// ssh.Dial 的 Timeout 只约束 TCP 拨号；握手（banner/kex/auth）必须自己给 deadline。
+	if err := connection.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return deployResult{}, err
+	}
 	clientConnection, channels, requests, err := ssh.NewClientConn(connection, address, config)
 	if err != nil {
+		return deployResult{}, err
+	}
+	if err := connection.SetDeadline(time.Time{}); err != nil {
 		return deployResult{}, err
 	}
 	client := ssh.NewClient(clientConnection, channels, requests)
@@ -980,14 +1059,30 @@ func deploySSH(node Node, script string) (deployResult, error) {
 		return deployResult{}, err
 	}
 	defer session.Close()
-	var output bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	session.Stdin = strings.NewReader(script)
-	session.Stdout = &output
-	session.Stderr = &output
-	if err := session.Run("bash -s"); err != nil {
-		return deployResult{}, fmt.Errorf("远程脚本失败: %w\n%s", err, output.String())
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+	type runOutcome struct {
+		result deployResult
+		err    error
 	}
-	return deployResult{output: output.String(), fingerprint: fingerprint}, nil
+	finished := make(chan runOutcome, 1)
+	go func() {
+		err := session.Run("bash -s")
+		finished <- runOutcome{deployResult{output: stdout.String() + stderr.String(), fingerprint: fingerprint}, err}
+	}()
+	select {
+	case outcome := <-finished:
+		if outcome.err != nil {
+			return deployResult{}, fmt.Errorf("远程脚本失败: %w\n%s", outcome.err, outcome.result.output)
+		}
+		return outcome.result, nil
+	case <-time.After(timeout):
+		_ = session.Close()
+		_ = client.Close()
+		return deployResult{}, fmt.Errorf("远程脚本执行超过 %s，已中止", timeout)
+	}
 }
 
 func openBrowser(address string) {
@@ -1005,9 +1100,10 @@ func openBrowser(address string) {
 }
 
 func main() {
-	var dataDir, listen, publicBase, agentDir string
+	var dataDir, listen, publicListen, publicBase, agentDir string
 	flag.StringVar(&dataDir, "data-dir", "", "本地配置目录")
-	flag.StringVar(&listen, "listen", "127.0.0.1:0", "监听地址；默认仅本机")
+	flag.StringVar(&listen, "listen", "127.0.0.1:0", "本地管理监听地址；默认仅本机")
+	flag.StringVar(&publicListen, "public-listen", "", "仅对外提供安装脚本与探针下载的监听地址，例如 0.0.0.0:8443；默认关闭")
 	flag.StringVar(&publicBase, "public-base", "", "脚本下载使用的公开基址，例如 https://installer.example.com")
 	flag.StringVar(&agentDir, "agent-dir", "", "节点探针二进制目录")
 	flag.Parse()
@@ -1029,10 +1125,6 @@ func main() {
 		os.Exit(1)
 	}
 	localAddress := "http://" + listener.Addr().String()
-	if publicBase == "" {
-		publicBase = localAddress
-	}
-	publicBase = strings.TrimRight(publicBase, "/")
 	if agentDir == "" {
 		executable, err := os.Executable()
 		if err == nil {
@@ -1041,9 +1133,33 @@ func main() {
 	}
 	application := &app{store: state, publicBase: publicBase, agentDir: agentDir}
 	server := &http.Server{Handler: http.HandlerFunc(application.serveHTTP), ReadHeaderTimeout: 5 * time.Second}
+	var publicServer *http.Server
+	if publicListen != "" {
+		publicListener, err := net.Listen("tcp", publicListen)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "启动公开安装服务: %v\n", err)
+			os.Exit(1)
+		}
+		if application.publicBase == "" {
+			application.publicBase = "http://" + publicListener.Addr().String()
+		}
+		publicServer = &http.Server{Handler: http.HandlerFunc(application.servePublic), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := publicServer.Serve(publicListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Fprintln(os.Stderr, err)
+			}
+		}()
+	}
+	if application.publicBase == "" {
+		application.publicBase = localAddress
+	}
+	application.publicBase = strings.TrimRight(application.publicBase, "/")
 	fmt.Printf("组队安装器正在运行：%s\n", localAddress)
-	if publicBase != localAddress {
-		fmt.Printf("专属安装脚本基址：%s\n", publicBase)
+	if application.publicBase != localAddress {
+		fmt.Printf("专属安装脚本基址：%s\n", application.publicBase)
+	}
+	if strings.Contains(application.publicBase, "://0.0.0.0") || strings.Contains(application.publicBase, "://[::]") {
+		fmt.Fprintln(os.Stderr, "警告：public-base 为空且监听通配地址，自动推导的安装基址目标机无法访问；请显式设置 -public-base。")
 	}
 	openBrowser(localAddress)
 	go func() {
@@ -1057,4 +1173,7 @@ func main() {
 	context, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = server.Shutdown(context)
+	if publicServer != nil {
+		_ = publicServer.Shutdown(context)
+	}
 }

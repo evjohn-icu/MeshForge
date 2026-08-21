@@ -30,4 +30,10 @@ for package in "$DIST/linux-amd64" "$DIST/macos-amd64" "$DIST/macos-arm64"; do
   install -m 0755 "$ROOT/scripts/start.sh" "$package/start.sh"
 done
 
+for package in "$DIST/linux-amd64" "$DIST/macos-amd64" "$DIST/macos-arm64" "$DIST/windows-amd64"; do
+  mkdir -p "$package/agents"
+  cp "$DIST"/agents/* "$package/agents/"
+done
+
 echo "已生成跨平台入口：$DIST"
+

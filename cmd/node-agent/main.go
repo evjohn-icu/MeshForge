@@ -35,17 +35,20 @@ type PongResponse struct {
 func main() {
 	var listen, token, nodeID, overlayIP string
 	var once bool
+	var onceTimeout time.Duration
 	flag.StringVar(&listen, "listen", "127.0.0.1:19090", "HTTP listen address")
 	flag.StringVar(&token, "token", "", "shared probe token")
 	flag.StringVar(&nodeID, "node-id", "", "stable node identifier")
 	flag.StringVar(&overlayIP, "overlay-ip", "", "EasyTier overlay IPv4")
 	flag.BoolVar(&once, "once", false, "exit after one successful ping")
+	flag.DurationVar(&onceTimeout, "once-timeout", 15*time.Minute, "with --once: exit after this long without a successful ping")
 	flag.Parse()
 	if token == "" || nodeID == "" || overlayIP == "" {
 		log.Fatal("--token, --node-id, and --overlay-ip are required")
 	}
 
 	var server *http.Server
+	var onceTimer *time.Timer
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/ping", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -69,11 +72,18 @@ func main() {
 			Architecture: runtime.GOARCH, CPUCores: runtime.NumCPU(), MemoryTotalKiB: memoryTotalKiB(),
 		})
 		if once {
+			onceTimer.Stop()
 			go func() { time.Sleep(100 * time.Millisecond); _ = server.Close() }()
 		}
 	})
 
 	server = &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	if once {
+		onceTimer = time.AfterFunc(onceTimeout, func() {
+			log.Printf("no ping received within %s; exiting", onceTimeout)
+			_ = server.Close()
+		})
+	}
 	log.Printf("node probe listening on %s", listen)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)

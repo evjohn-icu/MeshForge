@@ -41,6 +41,19 @@ curl -fsSL 'https://…/install.sh' | sudo bash -s -- -v 'v2.6.4' -b '<base64 �
 
 注意：base64 是编码不是加密，拿到命令的人可以还原出网络密钥——命令别外传，密钥泄露后换密钥重装即可。
 
+#### 部署到 Cloudflare Pages（推荐）
+
+生成器是纯静态单文件，Pages 免费、全球 CDN、自带 HTTPS，国内可达性优于 GitHub Pages：
+
+1. Cloudflare Dashboard → **Workers & Pages** → Create → **Pages** → Connect to Git，选 `evjohn-icu/MeshForge` 仓库。
+2. 构建命令留空，构建输出目录填 `web`。
+3. 保存后 Pages 自动部署并分配 `https://<项目名>.pages.dev`；可在 Custom domains 绑定自己的域名。
+4. 打开 `https://<域名>/generator.html`，生成命令——安装脚本地址会自动指向同域的 `/install.sh`（生成器同源默认，目标机拉得到）。
+
+也可以直接上传 `web/` 目录到任意静态托管（GitHub Pages / Nginx / OSS）。本地使用：直接双击 `web/generator.html`，或跑 controller 后访问 `http://127.0.0.1:<port>/generator.html`（controller 已内嵌 install.sh，本地同样可用）。
+
+注意：部署后 EasyTier 二进制仍从 GitHub 下载（install.sh 内部），国内目标机靠 ghfast 自动回退。想更快可把 release 包镜像到 R2 并设置 `--proxy`。
+
 ### 方式二：本地控制器（SSH 部署 + 探针）
 
 ```sh

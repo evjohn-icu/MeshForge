@@ -54,7 +54,7 @@ pre{max-height:50vh;overflow:auto;white-space:pre-wrap;background:#101a2a;color:
 <section class="panel"><div class="section-heading"><span>03</span><h2>安装</h2><small>Relay 节点自动加 --open-firewall；成员节点自动生成 [[peer]] 指向 Relay</small></div>
 <div class="grid three">
 <label>EasyTier 版本<input id="version" value="v2.6.4" placeholder="v2.6.4"></label>
-<label>安装脚本地址<input id="installScriptURL" placeholder="https://example.com/install.sh"></label>
+<label>安装脚本地址<input id="installScriptURL" placeholder="留空 = 本页同源 /install.sh"></label>
 <label>GitHub 下载代理<input id="proxy" placeholder="https://ghfast.top/（留空自动）"></label>
 </div>
 <div class="actions"><button type="button" id="generate" class="primary">生成配置与安装命令</button></div>
@@ -190,7 +190,8 @@ function buildTomlFor(node, relayNode) {
 function buildCommand(toml, node) {
   const version = $("version").value.trim() || "v2.6.4";
   const proxy = $("proxy").value.trim();
-  const scriptURL = $("installScriptURL").value.trim() || "https://raw.githubusercontent.com/evjohn-icu/MeshForge/main/scripts/install.sh";
+  const sameOrigin = new URL("install.sh", window.location.href);
+  const scriptURL = $("installScriptURL").value.trim() || (sameOrigin.protocol === "file:" ? "https://raw.githubusercontent.com/evjohn-icu/MeshForge/main/scripts/install.sh" : sameOrigin.href);
   const b64 = btoa(unescape(encodeURIComponent(toml)));
   const parts = [`curl -fsSL '${scriptURL}' | sudo bash -s -- -v '${version}' -b '${b64}'`];
   if (proxy) parts.push(`--proxy '${proxy}'`);

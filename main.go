@@ -30,7 +30,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-//go:embed web/*
+//go:embed web/* scripts/install.sh
 var webFS embed.FS
 
 type Node struct {
@@ -812,8 +812,22 @@ func (a *app) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		a.serveAgent(w, r)
 		return
 	}
+	if r.URL.Path == "/install.sh" {
+		a.serveInstallScript(w)
+		return
+	}
 	web, _ := fs.Sub(webFS, "web")
 	http.FileServer(http.FS(web)).ServeHTTP(w, r)
+}
+
+func (a *app) serveInstallScript(w http.ResponseWriter) {
+	content, err := fs.ReadFile(webFS, "scripts/install.sh")
+	if err != nil {
+		http.Error(w, "安装脚本不可用", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	_, _ = w.Write(content)
 }
 
 // servePublic 只对外提供安装脚本与探针二进制，管理 API 与 UI 一律不可达。
@@ -824,6 +838,10 @@ func (a *app) servePublic(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, "/agents/") {
 		a.serveAgent(w, r)
+		return
+	}
+	if r.URL.Path == "/install.sh" {
+		a.serveInstallScript(w)
 		return
 	}
 	http.NotFound(w, r)

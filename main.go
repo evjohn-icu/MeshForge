@@ -54,6 +54,9 @@ type Project struct {
 	ReleaseVersion   string `json:"releaseVersion"`
 	NetworkName      string `json:"networkName"`
 	NetworkSecret    string `json:"networkSecret"`
+	IPv4CIDR         string `json:"ipv4CIDR"`
+	MagicDNS         bool   `json:"magicDNS"`
+	DHCP             bool   `json:"dhcp"`
 	GitHubProxy      string `json:"githubProxy"`
 	ScriptBaseURL    string `json:"scriptBaseURL"`
 	ProbeToken       string `json:"probeToken"`
@@ -81,6 +84,8 @@ func defaultProject() Project {
 	return Project{
 		Name:           "我的组网",
 		ReleaseVersion: "v2.6.4",
+		IPv4CIDR:       "10.144.144.0/24",
+		MagicDNS:       true,
 		ProbeToken:     randomHex(32),
 		WireGuardPort:  11013,
 		WireGuardCIDR:  "10.14.14.0/24",
@@ -108,6 +113,10 @@ func loadStore(path string) (*store, error) {
 			s.project.Nodes[index].ID = newID()
 		}
 	}
+	if s.project.IPv4CIDR == "" {
+		s.project.IPv4CIDR = deriveSubnet(s.project.Relay.OverlayIP)
+	}
+	s.project = assignOverlayIPs(s.project)
 	if err := validateProject(s.project); err != nil {
 		return nil, fmt.Errorf("本地状态校验失败: %w", err)
 	}
@@ -136,6 +145,7 @@ func (s *store) saveLocked(project Project) error {
 	if project.ProbeToken == "" {
 		project.ProbeToken = randomHex(32)
 	}
+	project = assignOverlayIPs(project)
 	if err := validateProject(project); err != nil {
 		return err
 	}
@@ -228,6 +238,10 @@ func validateProject(project Project) error {
 	if invalidConfigString(project.NetworkName) || invalidConfigString(project.NetworkSecret) {
 		return errors.New("网络名称和网络密钥不能为空，且不能包含换行符")
 	}
+	subnetIP, subnet, err := net.ParseCIDR(project.IPv4CIDR)
+	if err != nil || subnetIP.To4() == nil {
+		return errors.New("IPv4 网段无效，例如 10.144.144.0/24")
+	}
 	if project.GitHubProxy != "" {
 		parsed, err := url.Parse(project.GitHubProxy)
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
@@ -262,13 +276,18 @@ func validateProject(project Project) error {
 			return fmt.Errorf("节点名称重复：%s", node.Name)
 		}
 		names[node.Name] = true
-		if net.ParseIP(node.OverlayIP) == nil || !strings.Contains(node.OverlayIP, ".") {
-			return fmt.Errorf("节点 %s 的虚拟 IP 无效", node.Name)
+		if !project.DHCP {
+			if net.ParseIP(node.OverlayIP) == nil || !strings.Contains(node.OverlayIP, ".") {
+				return fmt.Errorf("节点 %s 的虚拟 IP 无效", node.Name)
+			}
+			if !subnet.Contains(net.ParseIP(node.OverlayIP)) {
+				return fmt.Errorf("节点 %s 的虚拟 IP 不在网段 %s 内", node.Name, project.IPv4CIDR)
+			}
+			if ips[node.OverlayIP] {
+				return fmt.Errorf("虚拟 IP 重复：%s", node.OverlayIP)
+			}
+			ips[node.OverlayIP] = true
 		}
-		if ips[node.OverlayIP] {
-			return fmt.Errorf("虚拟 IP 重复：%s", node.OverlayIP)
-		}
-		ips[node.OverlayIP] = true
 		if node.OS != "linux" && node.OS != "windows" {
 			return fmt.Errorf("节点 %s 的系统必须是 Linux 或 Windows", node.Name)
 		}
@@ -286,6 +305,76 @@ func validateProject(project Project) error {
 		return errors.New("Relay 必须是填写公网地址的 Linux 节点")
 	}
 	return nil
+}
+
+// deriveSubnet 从节点 IP 推导 /24 网段（旧状态迁移用）。
+func deriveSubnet(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() == nil {
+		return "10.144.144.0/24"
+	}
+	parsed[15] = 0
+	return parsed.String() + "/24"
+}
+
+// assignOverlayIPs 在非 DHCP 模式下从网段自动分配空缺的虚拟 IP：relay 优先 .1，成员依次递增。
+func assignOverlayIPs(project Project) Project {
+	if project.DHCP {
+		return project
+	}
+	ip, network, err := net.ParseCIDR(project.IPv4CIDR)
+	if err != nil || ip.To4() == nil {
+		return project
+	}
+	base := network.IP.To4()
+	if base == nil {
+		return project
+	}
+	used := map[string]bool{}
+	for _, node := range append([]Node{project.Relay}, project.Nodes...) {
+		if node.OverlayIP != "" {
+			used[node.OverlayIP] = true
+		}
+	}
+	next := func() string {
+		for host := 1; host < 255; host++ {
+			candidate := net.IPv4(base[0], base[1], base[2], byte(host)).String()
+			if !used[candidate] {
+				used[candidate] = true
+				return candidate
+			}
+		}
+		return ""
+	}
+	if project.Relay.OverlayIP == "" {
+		project.Relay.OverlayIP = next()
+	}
+	for index := range project.Nodes {
+		if project.Nodes[index].OverlayIP == "" {
+			project.Nodes[index].OverlayIP = next()
+		}
+	}
+	return project
+}
+
+// dnsHostname 把节点名转成 MagicDNS 可用的主机名（小写，仅字母数字与连字符）。
+func dnsHostname(node Node) string {
+	var builder strings.Builder
+	lastDash := false
+	for _, char := range strings.ToLower(node.Name) {
+		if char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-' {
+			builder.WriteRune(char)
+			lastDash = char == '-'
+		} else if !lastDash && builder.Len() > 0 {
+			builder.WriteRune('-')
+			lastDash = true
+		}
+	}
+	hostname := strings.Trim(builder.String(), "-")
+	if hostname == "" {
+		hostname = "node-" + shortID(node.ID)
+	}
+	return hostname
 }
 
 func validVersion(version string) bool {
@@ -343,7 +432,12 @@ func nodeConfig(project Project, node Node) string {
 	}
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "instance_name = %s\n", tomlString(node.Name))
-	fmt.Fprintf(&builder, "ipv4 = %s\n", tomlString(node.OverlayIP))
+	fmt.Fprintf(&builder, "hostname = %s\n", tomlString(dnsHostname(node)))
+	if project.DHCP {
+		builder.WriteString("dhcp = true\n")
+	} else {
+		fmt.Fprintf(&builder, "ipv4 = %s\n", tomlString(node.OverlayIP))
+	}
 	fmt.Fprintf(&builder, "listeners = [%s]\n", strings.Join(listeners, ", "))
 	fmt.Fprintf(&builder, "mapped_listeners = [%s]\n\n", strings.Join(mapped, ", "))
 	if node.Role == "relay" && project.WireGuardEnabled {
@@ -354,6 +448,9 @@ func nodeConfig(project Project, node Node) string {
 		fmt.Fprintf(&builder, "\n[[peer]]\nuri = %s\n", tomlString(peer))
 	}
 	builder.WriteString("\n[flags]\nenable_encryption = true\nmtu = 1380\n")
+	if project.MagicDNS {
+		builder.WriteString("accept_dns = true\n")
+	}
 	return builder.String()
 }
 
@@ -921,6 +1018,10 @@ func (a *app) probeOne(project Project, node Node, client *http.Client) probeRes
 	result := probeResult{NodeID: node.ID, Name: node.Name, OverlayIP: node.OverlayIP}
 	if node.OS != "linux" {
 		result.PingError = "一次性探针目前要求 Linux SSH 节点"
+		return result
+	}
+	if node.OverlayIP == "" {
+		result.PingError = "DHCP 网络下节点 IP 由 EasyTier 分配，暂不支持探针"
 		return result
 	}
 	if err := startEphemeralProbe(node, a.installBase(project), project.ProbeToken); err != nil {

@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>EasyTier 配置生成器</title><style>
+:root{--ink:#1a2333;--muted:#68738a;--paper:#f7f8fc;--panel:#fff;--line:#d8deeb;--blue:#164e9c;--teal:#087b72;--amber:#f2b44f;font-family:Inter,"Noto Sans SC","Microsoft YaHei",sans-serif;color:var(--ink);background:var(--paper)}
+*{box-sizing:border-box}body{margin:0;min-width:320px}button,input,select{font:inherit}
+.shell{width:min(980px,calc(100% - 32px));margin:0 auto;padding:42px 0 72px}
+.masthead{display:flex;justify-content:space-between;gap:24px;align-items:end;padding-bottom:28px;border-bottom:3px solid var(--ink)}
+.eyebrow{margin:0 0 8px;color:var(--teal);font:700 12px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em}
+h1{margin:0;font-size:clamp(2rem,5vw,3.4rem);letter-spacing:-.055em;line-height:.95}
+h2{font-size:1.05rem;margin:0}
+.intro{color:var(--muted);max-width:760px;margin:22px 0 30px;line-height:1.65}
+.panel{margin-top:20px;background:var(--panel);border:1px solid var(--line);box-shadow:0 2px 0 rgba(26,35,51,.04);padding:22px}
+.section-heading{display:flex;align-items:baseline;gap:10px;margin-bottom:18px}
+.section-heading>span{color:var(--teal);font:700 12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.section-heading small{color:var(--muted)}
+.grid{display:grid;gap:16px}.grid.three{grid-template-columns:repeat(3,1fr)}
+label{display:grid;gap:7px;color:var(--muted);font-size:.82rem;font-weight:650}
+input,select{width:100%;border:1px solid var(--line);background:#fbfcff;padding:10px 11px;border-radius:4px;color:var(--ink)}
+input:focus,select:focus,button:focus-visible{outline:3px solid #a5c7ff;outline-offset:2px}
+.toggles{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:18px}
+.toggle{display:flex;gap:10px;align-items:start;border:1px solid var(--line);border-radius:6px;padding:12px 14px;background:#fbfcff;cursor:pointer}
+.toggle input{margin-top:3px;width:auto}
+.toggle span{display:grid;gap:3px}
+.toggle strong{color:var(--ink);font-size:.9rem}
+.toggle small{color:var(--muted);font-size:.78rem;line-height:1.45}
+.node-card{padding:18px 0;border-top:1px solid var(--line)}
+.node-card:first-child{border-top:0;padding-top:0}
+.node-header{display:flex;justify-content:space-between;margin-bottom:12px}
+.node-title{font:700 .95rem ui-monospace,SFMono-Regular,Menlo,monospace}
+.actions{display:flex;justify-content:end;margin-top:20px}
+button{border:0;border-radius:4px;cursor:pointer;padding:10px 13px;font-weight:720}
+.primary{background:var(--blue);color:#fff}.primary:hover{background:#0e3b7b}
+.quiet{background:transparent;color:var(--blue);padding:5px}.quiet:hover{background:#edf3ff}
+pre{max-height:50vh;overflow:auto;white-space:pre-wrap;background:#101a2a;color:#eaf1ff;padding:16px;font:.8rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+@media(max-width:760px){.shell{width:min(100% - 20px,980px);padding-top:22px}.masthead{align-items:start;flex-direction:column}.grid.three{grid-template-columns:1fr}}
+</style></head><body>
+<main class="shell">
+<header class="masthead"><div><p class="eyebrow">EASYTIER / CONFIG GENERATOR</p><h1>配置生成器</h1></div><div id="status" class="status" style="border-left:3px solid var(--amber);padding:10px 0 10px 12px;color:var(--muted);font-size:.9rem">纯前端，数据不出浏览器</div></header>
+<section class="intro"><p>填网络信息，生成 EasyTier TOML 配置和一条安装命令。命令里内嵌 base64 配置，配合通用安装脚本一条命令装好并注册为服务。本页无后端，所有数据只在本机浏览器里。</p></section>
+<section class="panel"><div class="section-heading"><span>01</span><h2>网络</h2></div>
+<div class="grid three">
+<label>网络名称<input id="networkName" placeholder="team-network"></label>
+<label>网络密钥<input id="networkSecret" type="password" autocomplete="new-password" placeholder="至少 16 位随机字符串"></label>
+<label>IPv4 网段<input id="ipv4CIDR" value="10.144.144.0/24" placeholder="10.144.144.0/24"></label>
+</div>
+<div class="toggles">
+<label class="toggle"><input id="magicDNS" type="checkbox" checked><span><strong>MagicDNS</strong><small>用节点名互相访问（如 office-pc.et.net）；会修改系统 DNS 设置</small></span></label>
+<label class="toggle"><input id="dhcp" type="checkbox"><span><strong>DHCP 自动分配</strong><small>IP 由 EasyTier 分配（从 10.0.0.1 起），忽略上方网段</small></span></label>
+</div>
+</section>
+<section class="panel"><div class="section-heading"><span>02</span><h2>节点</h2><button type="button" id="add-node" class="quiet">添加节点</button></div>
+<div id="nodes"></div>
+</section>
+<section class="panel"><div class="section-heading"><span>03</span><h2>安装</h2><small>relay 节点勾选「放行防火墙」；安装脚本地址默认用 GitHub 上的通用脚本</small></div>
+<div class="grid three">
+<label>EasyTier 版本<input id="version" value="v2.6.4" placeholder="v2.6.4"></label>
+<label>安装脚本地址<input id="installScriptURL" placeholder="https://example.com/install.sh"></label>
+<label>GitHub 下载代理<input id="proxy" placeholder="https://ghfast.top/（留空自动）"></label>
+</div>
+<div class="actions"><button type="button" id="generate" class="primary">生成配置与安装命令</button></div>
+</section>
+<section class="panel" id="output-panel" hidden><div class="section-heading"><span>04</span><h2>结果</h2><button type="button" id="copy" class="quiet">复制命令</button></div>
+<p id="command" style="background:#101a2a;color:#eaf1ff;padding:14px;border-radius:4px;font:.8rem/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere"></p>
+<pre id="toml"></pre></section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const nodes = [];
+let nodeSeq = 1;
+
+function escapeToml(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+}
+function dnsHostname(name) {
+  let out = "", lastDash = false;
+  for (const ch of String(name).toLowerCase()) {
+    if (/[a-z0-9-]/.test(ch)) { out += ch; lastDash = ch === "-"; }
+    else if (!lastDash && out) { out += "-"; lastDash = true; }
+  }
+  out = out.replace(/^-+|-+$/g, "");
+  return out || "node-" + Math.random().toString(16).slice(2, 10);
+}
+function subnetBase(cidr) {
+  const match = /^(\d+\.\d+\.\d+)\.\d+\/\d+$/.exec(cidr || "");
+  return match ? match[1] : "10.144.144";
+}
+function usedIPs() {
+  const used = new Set();
+  nodes.forEach(node => node.overlayIP && used.add(node.overlayIP));
+  return used;
+}
+function nextIP() {
+  const base = subnetBase($("ipv4CIDR").value);
+  const used = usedIPs();
+  for (let host = 1; host < 255; host++) {
+    const candidate = `${base}.${host}`;
+    if (!used.has(candidate)) { used.add(candidate); return candidate; }
+  }
+  return `${base}.1`;
+}
+function addNode() {
+  const node = { name: `node-${nodeSeq++}`, overlayIP: nextIP(), relay: false, openFirewall: false };
+  nodes.push(node);
+  renderNodes();
+}
+function renderNodes() {
+  const container = $("nodes"); container.innerHTML = "";
+  nodes.forEach((node, index) => {
+    const card = document.createElement("article"); card.className = "node-card";
+    const header = document.createElement("div"); header.className = "node-header";
+    const title = document.createElement("strong"); title.className = "node-title"; title.textContent = node.name;
+    const remove = document.createElement("button"); remove.className = "remove-node quiet"; remove.textContent = "移除";
+    remove.addEventListener("click", () => { nodes.splice(index, 1); renderNodes(); });
+    header.append(title, remove);
+    const grid = document.createElement("div"); grid.className = "grid three";
+    const nameLabel = document.createElement("label"); nameLabel.textContent = "节点名称";
+    const nameInput = document.createElement("input"); nameInput.value = node.name;
+    nameInput.addEventListener("input", () => { node.name = nameInput.value; title.textContent = node.name || "未命名节点"; });
+    nameLabel.append(nameInput);
+    const ipLabel = document.createElement("label"); ipLabel.textContent = "虚拟 IP";
+    const ipInput = document.createElement("input"); ipInput.value = node.overlayIP;
+    ipInput.addEventListener("input", () => { node.overlayIP = ipInput.value.trim(); });
+    ipLabel.append(ipInput);
+    const relayLabel = document.createElement("label"); relayLabel.className = "toggle";
+    const relayInput = document.createElement("input"); relayInput.type = "checkbox"; relayInput.checked = node.relay;
+    relayInput.addEventListener("change", () => { node.relay = relayInput.checked; });
+    const relaySpan = document.createElement("span");
+    const relayStrong = document.createElement("strong"); relayStrong.textContent = "Relay 节点";
+    const relaySmall = document.createElement("small"); relaySmall.textContent = "监听公网端口并放行防火墙";
+    relaySpan.append(relayStrong, relaySmall);
+    relayLabel.append(relayInput, relaySpan);
+    grid.append(nameLabel, ipLabel, relayLabel);
+    card.append(header, grid);
+    container.append(card);
+  });
+}
+function buildToml() {
+  const networkName = $("networkName").value.trim();
+  const networkSecret = $("networkSecret").value.trim();
+  const cidr = $("ipv4CIDR").value.trim();
+  const dhcp = $("dhcp").checked;
+  const magicDNS = $("magicDNS").checked;
+  if (!networkName || !networkSecret) { alert("请填写网络名称和网络密钥"); return null; }
+  if (!dhcp && !/^\d+\.\d+\.\d+\.\d+\/\d+$/.test(cidr)) { alert("IPv4 网段格式无效，例如 10.144.144.0/24"); return null; }
+  if (!nodes.length) { alert("请至少添加一个节点"); return null; }
+  const lines = [];
+  lines.push(`instance_name = "${escapeToml(networkName)}"`);
+  lines.push(`hostname = "${dnsHostname(nodes[0].name)}"`);
+  if (dhcp) lines.push("dhcp = true");
+  else lines.push(`ipv4 = "${escapeToml(nodes[0].overlayIP)}"`);
+  lines.push('listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010"]');
+  if (nodes[0].relay) {
+    lines.push('mapped_listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010"]');
+  }
+  lines.push("");
+  lines.push("[network_identity]");
+  lines.push(`network_name = "${escapeToml(networkName)}"`);
+  lines.push(`network_secret = "${escapeToml(networkSecret)}"`);
+  lines.push("");
+  lines.push("[flags]");
+  lines.push("enable_encryption = true");
+  lines.push("mtu = 1380");
+  if (magicDNS) lines.push("accept_dns = true");
+  return lines.join("\n") + "\n";
+}
+function buildCommand(toml) {
+  const version = $("version").value.trim() || "v2.6.4";
+  const proxy = $("proxy").value.trim();
+  const scriptURL = $("installScriptURL").value.trim() || "https://raw.githubusercontent.com/evjohn-icu/MeshForge/main/scripts/install.sh";
+  const b64 = btoa(unescape(encodeURIComponent(toml)));
+  const parts = [`curl -fsSL '${scriptURL}' | sudo bash -s -- -v '${version}' -b '${b64}'`];
+  if (proxy) parts.push(`--proxy '${proxy}'`);
+  if (nodes[0].relay) parts.push("--open-firewall");
+  return parts.join(" ");
+}
+$("add-node").addEventListener("click", addNode);
+$("generate").addEventListener("click", () => {
+  const toml = buildToml();
+  if (!toml) return;
+  $("toml").textContent = toml;
+  $("command").textContent = buildCommand(toml);
+  $("output-panel").hidden = false;
+});
+$("copy").addEventListener("click", async () => {
+  await navigator.clipboard.writeText($("command").textContent);
+  $("copy").textContent = "已复制";
+  setTimeout(() => { $("copy").textContent = "复制命令"; }, 1200);
+});
+addNode();
+</script>
+</body></html>

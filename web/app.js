@@ -13,9 +13,29 @@ const output = $("#output");
 const qrCode = $("#qr-code");
 
 function nodeId() { return crypto.randomUUID(); }
+function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", "'":"&#39;", '"':"&quot;" }[ch])); }
+
+function subnetBase(cidr) {
+  const match = /^(\d+\.\d+\.\d+)\.\d+\/\d+$/.exec(cidr || "");
+  return match ? match[1] : "10.144.144";
+}
+function usedIPs() {
+  const used = new Set();
+  if (project?.relay?.overlayIP) used.add(project.relay.overlayIP);
+  (project?.nodes || []).forEach(node => node.overlayIP && used.add(node.overlayIP));
+  return used;
+}
+function nextIP() {
+  const base = subnetBase(project?.ipv4CIDR);
+  const used = usedIPs();
+  for (let host = 1; host < 255; host++) {
+    const candidate = `${base}.${host}`;
+    if (!used.has(candidate)) { used.add(candidate); return candidate; }
+  }
+  return `${base}.1`;
+}
 function emptyNode(role = "member") {
-  const next = (project?.nodes?.length || 0) + 2;
-  return { id: nodeId(), role, name: role === "relay" ? "relay-vps" : `node-${next}`, os: "linux", linuxDeviceType: role === "relay" ? "server" : "auto", overlayIP: `10.144.144.${next}`, host: "", sshPort: 22, sshUser: "root", sshAuth: "key", sshPrivateKey: "", sshPassword: "", hostKeyFingerprint: "" };
+  return { id: nodeId(), role, name: role === "relay" ? "relay-vps" : `node-${(project?.nodes?.length || 0) + 1}`, os: "linux", linuxDeviceType: role === "relay" ? "server" : "auto", overlayIP: nextIP(), host: "", sshPort: 22, sshUser: "root", sshAuth: "key", sshPrivateKey: "", sshPassword: "", hostKeyFingerprint: "" };
 }
 function field(label, key, value, type = "text", placeholder = "") {
   return `<label>${label}<input data-key="${key}" type="${type}" value="${escapeHtml(value ?? "")}" placeholder="${placeholder}"></label>`;
@@ -23,25 +43,29 @@ function field(label, key, value, type = "text", placeholder = "") {
 function selectField(label, key, value, options) {
   return `<label>${label}<select data-key="${key}">${options.map(([v, text]) => `<option value="${v}" ${v === value ? "selected" : ""}>${text}</option>`).join("")}</select></label>`;
 }
-function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", "'":"&#39;", '"':"&quot;" }[ch])); }
-function nodeFields(node, includeRole = false) {
+function nodeFields(node, isRelay = false) {
+  const dhcp = Boolean(project?.dhcp);
   return [
     field("节点名称", "name", node.name, "text", "例如：office-pc"),
     selectField("系统", "os", node.os, [["linux", "Linux"], ["windows", "Windows"]]),
-    selectField("Linux 设备类型", "linuxDeviceType", node.linuxDeviceType || (node.role === "relay" ? "server" : "auto"), [["auto", "自动检测桌面"], ["desktop", "桌面设备（安装 GUI）"], ["server", "服务器（仅命令行）"]]),
-    field("虚拟 IP", "overlayIP", node.overlayIP, "text", "10.144.144.2"),
-    field("公网地址 / SSH 主机", "host", node.host, "text", "relay.example.com"),
+    ...(dhcp ? [] : [field("虚拟 IP", "overlayIP", node.overlayIP, "text", "10.144.144.2")]),
+    ...(isRelay ? [field("公网地址", "host", node.host, "text", "relay.example.com")] : []),
+    `<details class="ssh-details"><summary>SSH 部署（可选）</summary><div class="grid three">`,
+    ...(isRelay ? [] : [field("SSH 主机", "host", node.host, "text", "192.168.1.10")]),
     field("SSH 端口", "sshPort", node.sshPort || 22, "number"),
     field("SSH 用户", "sshUser", node.sshUser || "root", "text"),
     selectField("SSH 登录方式", "sshAuth", node.sshAuth || "key", [["key", "私钥文件"], ["password", "密码"]]),
     field("私钥文件路径", "sshPrivateKey", node.sshPrivateKey, "text", "~/.ssh/id_ed25519"),
     field("SSH 密码（本地保存）", "sshPassword", node.sshPassword, "password"),
     field("已信任主机指纹", "hostKeyFingerprint", node.hostKeyFingerprint, "text", "自动首次记录"),
-    ...(includeRole ? [field("角色", "role", node.role, "hidden")] : []),
+    selectField("Linux 设备类型", "linuxDeviceType", node.linuxDeviceType || (isRelay ? "server" : "auto"), [["auto", "自动检测桌面"], ["desktop", "桌面设备（安装 GUI）"], ["server", "服务器（仅命令行）"]]),
+    `</div></details>`,
   ].join("");
 }
 function render() {
-  ["name", "releaseVersion", "networkName", "networkSecret", "githubProxy", "scriptBaseURL", "wireGuardPort", "wireGuardCIDR"].forEach(key => form.elements[key].value = project[key] || "");
+  ["name", "releaseVersion", "networkName", "networkSecret", "ipv4CIDR", "githubProxy", "scriptBaseURL", "wireGuardPort", "wireGuardCIDR"].forEach(key => form.elements[key].value = project[key] || "");
+  form.elements.magicDNS.checked = Boolean(project.magicDNS);
+  form.elements.dhcp.checked = Boolean(project.dhcp);
   form.elements.wireGuardEnabled.checked = Boolean(project.wireGuardEnabled);
   $("#relay-fields").innerHTML = nodeFields(project.relay, true);
   const container = $("#nodes"); container.innerHTML = "";
@@ -62,9 +86,11 @@ function readFields(container, base) {
 }
 function collectProject() {
   const next = { ...project };
-  ["name", "releaseVersion", "networkName", "networkSecret", "githubProxy", "scriptBaseURL", "wireGuardPort", "wireGuardCIDR"].forEach(key => next[key] = form.elements[key].value.trim());
+  ["name", "releaseVersion", "networkName", "networkSecret", "ipv4CIDR", "githubProxy", "scriptBaseURL", "wireGuardCIDR"].forEach(key => next[key] = form.elements[key].value.trim());
+  next.magicDNS = form.elements.magicDNS.checked;
+  next.dhcp = form.elements.dhcp.checked;
   next.wireGuardEnabled = form.elements.wireGuardEnabled.checked;
-  next.wireGuardPort = Number(next.wireGuardPort || 11013);
+  next.wireGuardPort = Number(form.elements.wireGuardPort.value || 11013);
   next.relay = readFields($("#relay-fields"), project.relay);
   next.nodes = [...$("#nodes").children].map(card => readFields(card.querySelector(".node-fields"), project.nodes.find(node => node.id === card.dataset.id)));
   return next;
@@ -74,17 +100,22 @@ function showOutput(title, message, text, qr = "") {
 }
 function button(label, action, className = "") { const item = document.createElement("button"); item.textContent = label; item.className = className; item.addEventListener("click", action); return item; }
 function renderDeployments() {
-  const nodes = [project.relay, ...project.nodes]; const list = $("#deployment-list"); list.innerHTML = "";
-  list.append(button("顺序探针：POST/PONG + iperf3", runProbes, "primary"));
+  const list = $("#deployment-list"); list.innerHTML = "";
+  const nodes = [project.relay, ...project.nodes];
   nodes.forEach(node => {
     const row = document.createElement("div"); row.className = "deployment-row";
-    const meta = document.createElement("div"); meta.className = "deploy-meta"; meta.innerHTML = `<strong>${escapeHtml(node.name || "未命名节点")}</strong><small>${escapeHtml(node.os)} · ${escapeHtml(node.overlayIP || "未分配 IP")} · ${escapeHtml(node.host || "未填写主机")}</small>`;
-    const actions = document.createElement("div"); actions.className = "deploy-buttons";
-    if (node.os === "linux") actions.append(button("SSH 部署", () => deploy(node), "ssh"));
-    actions.append(button(node.os === "windows" ? "生成 PS1 与二维码" : "生成安装链接", () => installLink(node)));
-    actions.append(button("查看脚本", () => viewScript(node)));
-    row.append(meta, actions); list.append(row);
+    const meta = document.createElement("div"); meta.className = "deploy-meta";
+    const title = document.createElement("strong"); title.textContent = node.name;
+    const detail = document.createElement("small"); detail.textContent = `${node.os} · ${node.overlayIP || "DHCP 分配"} · ${node.host || "未填写主机"}`;
+    meta.append(title, detail);
+    const buttons = document.createElement("div"); buttons.className = "deploy-buttons";
+    if (node.os === "linux") buttons.append(button("SSH 部署", () => deploy(node), "ssh"));
+    buttons.append(button("生成安装链接", () => installLink(node)));
+    buttons.append(button("查看脚本", () => viewScript(node)));
+    row.append(meta, buttons); list.append(row);
   });
+  const probe = button("顺序探针：POST/PONG + iperf3", runProbes, "quiet");
+  list.append(probe);
 }
 async function viewScript(node) { try { const result = await api(`/api/nodes/${node.id}/script`, { method: "POST" }); showOutput(`${node.name} 的专属脚本`, "脚本尚未执行；确认内容后可复制或生成短期链接。", result.script); } catch (error) { showOutput("无法生成脚本", error.message, ""); } }
 async function installLink(node) { try { const result = await api(`/api/nodes/${node.id}/install-link`, { method: "POST" }); showOutput(`${node.name} 的安装入口`, "链接仅能使用一次，60 分钟后失效。二维码包含同一条命令。", result.command, result.qrDataURL); } catch (error) { showOutput("无法生成安装入口", error.message, ""); } }

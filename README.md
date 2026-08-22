@@ -21,13 +21,23 @@ EasyTier 是一个开源（LGPL-3.0）的**去中心化 mesh VPN**，Rust 编写
 
 ## 快速开始
 
-```sh
-# 方式一：下载 release（见 Releases 页），解压后直接运行
-./team-installer -data-dir ./data
+### 方式一：在线配置生成器（纯前端，无需安装）
 
-# 方式二：从源码构建
-./build.sh
-./dist/linux-amd64/team-installer -data-dir ./data
+打开 [`web/generator.html`](web/generator.html)（或部署到任意静态托管，如 GitHub Pages）：
+填网络名称/密钥/网段、勾选特性、添加节点 → 一键生成 TOML 配置和一条内嵌 base64 配置的安装命令：
+
+```sh
+curl -fsSL 'https://…/install.sh' | sudo bash -s -- -v 'v2.6.4' -b '<base64 配置>' --open-firewall
+```
+
+数据完全在浏览器本地，不经过任何服务器。配合仓库里的通用安装脚本 [`scripts/install.sh`](scripts/install.sh)：
+下载官方 release、安装为 systemd/OpenRC 服务、写入配置，一条命令装好。适合快速分发和自托管。
+
+### 方式二：本地控制器（SSH 部署 + 探针）
+
+```sh
+# 下载 release（见 Releases 页），解压后直接运行
+./team-installer -data-dir ./data
 ```
 
 浏览器会自动打开管理界面。流程：

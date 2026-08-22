@@ -27,6 +27,8 @@ func testProject() Project {
 		ReleaseVersion: "v2.6.4",
 		NetworkName:    "team-network",
 		NetworkSecret:  "sixteen-character-secret",
+		IPv4CIDR:       "10.144.144.0/24",
+		MagicDNS:       true,
 		GitHubProxy:    "https://ghfast.top/",
 		Relay:          Node{ID: "aa000001", Role: "relay", Name: "relay", OS: "linux", OverlayIP: "10.144.144.1", Host: "relay.example.com", SSHPort: 22},
 		Nodes:          []Node{{ID: "bb000002", Role: "member", Name: "office", OS: "linux", OverlayIP: "10.144.144.2", SSHPort: 22}},
@@ -447,5 +449,75 @@ func TestWindowsScriptQuotesHostileValues(t *testing.T) {
 		if !strings.Contains(script, expected) {
 			t.Fatalf("windows script missing %q:\n%s", expected, script)
 		}
+	}
+}
+
+func TestAssignOverlayIPsFillsFromSubnet(t *testing.T) {
+	project := testProject()
+	project.Relay.OverlayIP = ""
+	project.Nodes[0].OverlayIP = ""
+	project.Nodes = append(project.Nodes, Node{ID: "cc000003", Name: "third", OS: "linux", OverlayIP: ""})
+	assigned := assignOverlayIPs(project)
+	if assigned.Relay.OverlayIP != "10.144.144.1" || assigned.Nodes[0].OverlayIP != "10.144.144.2" || assigned.Nodes[1].OverlayIP != "10.144.144.3" {
+		t.Fatalf("auto assignment = %s / %s / %s", assigned.Relay.OverlayIP, assigned.Nodes[0].OverlayIP, assigned.Nodes[1].OverlayIP)
+	}
+	project.Nodes[0].OverlayIP = "10.144.144.9"
+	assigned = assignOverlayIPs(project)
+	if assigned.Nodes[0].OverlayIP != "10.144.144.9" {
+		t.Fatalf("existing IP overwritten: %s", assigned.Nodes[0].OverlayIP)
+	}
+}
+
+func TestNodeConfigMagicDNSAndHostname(t *testing.T) {
+	project := testProject()
+	config := nodeConfig(project, project.Nodes[0])
+	for _, expected := range []string{`hostname = "office"`, "accept_dns = true"} {
+		if !strings.Contains(config, expected) {
+			t.Fatalf("config missing %q:\n%s", expected, config)
+		}
+	}
+	project.MagicDNS = false
+	if strings.Contains(nodeConfig(project, project.Nodes[0]), "accept_dns") {
+		t.Fatal("magic dns disabled but accept_dns emitted")
+	}
+	project.DHCP = true
+	config = nodeConfig(project, project.Nodes[0])
+	if !strings.Contains(config, "dhcp = true") || strings.Contains(config, "ipv4 =") {
+		t.Fatalf("dhcp config wrong:\n%s", config)
+	}
+	node := project.Nodes[0]
+	node.Name = "我的 节点"
+	config = nodeConfig(project, node)
+	if !strings.Contains(config, `hostname = "node-bb000002"`) {
+		t.Fatalf("hostile name hostname wrong:\n%s", config)
+	}
+}
+
+func TestLoadStoreMigratesSubnet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	project := testProject()
+	project.IPv4CIDR = ""
+	encoded, err := json.Marshal(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.project.IPv4CIDR != "10.144.144.0/24" {
+		t.Fatalf("migrated subnet = %q", state.project.IPv4CIDR)
+	}
+}
+
+func TestValidateProjectRejectsIPOutsideSubnet(t *testing.T) {
+	project := testProject()
+	project.Nodes[0].OverlayIP = "10.99.99.2"
+	if err := validateProject(project); err == nil {
+		t.Fatal("IP outside subnet passed validation")
 	}
 }
